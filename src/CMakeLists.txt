@@ -1,14 +1,30 @@
 set(SSR_MAIN_DIR ${CMAKE_CURRENT_SOURCE_DIR} CACHE INTERNAL "SSR main directory" FORCE)
 
+option(ENABLE_DUMP_INFO "Out put the stage info." ON)
+if (ENABLE_DUMP_INFO)
+    add_definitions("-D__PRINT_INFO__")
+endif()
+
+if (MSVC)
+    add_definitions("-DSODIUM_STATIC")
+    add_definitions("-DMBEDTLS_API")
+endif()
+
+if(ANDROID)
+include_directories(${LIB_ANCILLARY_DIR})
+endif()
+
 set(SOURCE_FILES_SNI
         shadowsocks.h
         socks5.h
         socks5.c
         http.c
         tls.c
-        rule.c)
+        )
 
 set(SOURCE_FILES_OBFS
+        strtrim.c
+        strtrim.h
         ssr_cipher_names.c
         ssr_cipher_names.h
         obfs/auth.c
@@ -35,9 +51,6 @@ set(SOURCE_FILES_LOCAL
         json.c
         encrypt.c
         cache.c
-        acl.c
-        netutils.c
-        udprelay.c
         local.c
         common.h
         includeobfs.h
@@ -58,8 +71,6 @@ set(SOURCE_FILES_CLIENT
         ssrbuffer.h
         ssrutils.c
         ssrutils.h
-        netutils.c
-        netutils.h
         udprelay.c
         udprelay.h
         client/defs.h
@@ -78,14 +89,16 @@ set(SOURCE_FILES_CLIENT
         client/client.c
         client/tls_cli.c
         client/tls_cli.h
-        ws_tls_basic.c
-        ws_tls_basic.h
+        websocket_basic.c
+        websocket_basic.h
         text_in_color.c
         text_in_color.h
         dump_info.c
         dump_info.h
         cmd_line_parser.c
         cmd_line_parser.h
+        exe_file_path.c
+        exe_file_path.h
         daemon_wrapper.c
         daemon_wrapper.h
         ${SOURCE_FILES_OBFS}
@@ -106,25 +119,29 @@ set(SOURCE_FILES_SERVER
         ../depends/http-parser/http_parser.h
         ../depends/http-parser/http_parser_wrapper.c
         ../depends/http-parser/http_parser_wrapper.h
-        ws_tls_basic.c
-        ws_tls_basic.h
+        websocket_basic.c
+        websocket_basic.h
         text_in_color.c
         text_in_color.h
         dump_info.c
         dump_info.h
+        client/s5.c
+        client/s5.h
         ssrutils.h
         ssrutils.c
         ssrbuffer.c
         ssrbuffer.h
         encrypt.c
-        #udprelay.c
+        udprelay.c
         cache.c
-        #resolv.c
-        netutils.c
+        ip_addr_cache.c
+        ip_addr_cache.h
         ssr_executive.c
         ssr_executive.h
         cmd_line_parser.c
         cmd_line_parser.h
+        exe_file_path.c
+        exe_file_path.h
         daemon_wrapper.c
         daemon_wrapper.h
         config_json.c
@@ -155,16 +172,15 @@ set(SOURCE_FILES_REDIR
 
 include_directories(obfs)
 include_directories(client)
+IF(MSVC)
+  include_directories( ${CMAKE_CURRENT_SOURCE_DIR}/../win32/include )
+ENDIF(MSVC)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${LIBUVDIR}/include)
-include_directories(${libcork_include_dirs})
-include_directories(${libipset_include_dirs})
-include_directories(${libudns_include_dirs})
 include_directories(${libsodium_include_dirs})
 include_directories(${LIB_JSON_C_DIR}/..)
-include_directories(${PCRE_INCLUDE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../depends/http-parser)
 
 if(USE_CRYPTO_MBEDTLS)
@@ -178,8 +194,19 @@ if (WIN32)
     list ( APPEND SOURCE_FILES_SERVER win32.c )
 endif ()
 
+if (MSVC)
+    list ( APPEND SOURCE_FILES_CLIENT ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/getopt.c ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/getopt_long.c ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/strncasecmp.c )
+    list ( APPEND SOURCE_FILES_LOCAL ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/getopt.c ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/getopt_long.c ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/strncasecmp.c )
+    list ( APPEND SOURCE_FILES_SERVER ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/getopt.c ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/getopt_long.c ${CMAKE_CURRENT_SOURCE_DIR}/../win32/src/strncasecmp.c )
+endif(MSVC)
+
 if (!APPLE)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthread")
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_definitions(-Wall -Werror -ggdb3 -std=c99 -Wextra -pedantic)
+    add_definitions("-D_DEFAULT_SOURCE -D_GNU_SOURCE")
 endif()
 
 if (UNIX)
@@ -190,6 +217,11 @@ endif()
 endif()
 
 add_definitions(-DUDP_RELAY_ENABLE)
+
+if(ANDROID)
+    LIST(APPEND SOURCE_FILES_LOCAL android.c)
+    LIST(APPEND SOURCE_FILES_CLIENT android.c)
+endif()
 
 add_executable(ssr-client ${SOURCE_FILES_CLIENT})
 add_executable(ssr-local ${SOURCE_FILES_LOCAL})
@@ -212,15 +244,16 @@ set_target_properties(ssr-server PROPERTIES COMPILE_DEFINITIONS MODULE_REMOTE)
 set (ss_lib_common
         json-c
         uv_a
-        m
-        libcork)
+        )
+
+if (MSVC)
+else()
+    list ( APPEND ss_lib_common m )
+endif()
 
 set (ss_lib_net
         ${ss_lib_common}
         mbedtls # /usr/local/lib/libcrypto.a # libcrypto.a # ${LIBCRYPTO} #
-        libipset
-        pcre #${PCRE_LIBRARIES}
-        udns
         sodium
         )
 
@@ -228,6 +261,10 @@ if (WIN32)
     list ( APPEND ss_lib_net Ws2_32 )
 endif()
 
+if(ANDROID)
+    LIST(APPEND ss_lib_net ancillary log)
+    set_target_properties(ssr-client PROPERTIES PREFIX "lib" SUFFIX ".so")
+endif()
 
 target_link_libraries(ssr-client ${ss_lib_net} uv-mbed)
 
@@ -238,7 +275,7 @@ target_link_libraries(ssr-server ${ss_lib_net})
 #target_link_libraries(ss_manager ${ss_lib_common} )
 #target_link_libraries(ss_redir ${ss_lib_net})
 
-install(TARGETS ssr-server ssr-local ssr-client 
+install(TARGETS ssr-server ssr-local ssr-client
     RUNTIME DESTINATION /usr/bin)
 
 install(FILES ../config.json 

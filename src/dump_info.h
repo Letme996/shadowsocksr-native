@@ -1,9 +1,11 @@
 #if !defined(__dump_info_h__)
 #define __dump_info_h__ 1
 
+#include <stddef.h>
+
 void set_app_name(const char *name);
 const char *get_app_name(void);
-void set_dump_info_callback(void(*callback)(const char *info, void *p), void *p);
+void set_dump_info_callback(void(*callback)(int dump_level, const char *info, void *p), void *p);
 
 void gmt_time_now(char *now_str, size_t size);
 void localtime_now(char *now_str, size_t size);
