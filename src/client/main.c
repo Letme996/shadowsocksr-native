@@ -38,19 +38,30 @@
 #include <unistd.h>  /* getopt */
 #endif
 
-#ifdef ANDROID
-int log_tx_rx  = 0;
-uint64_t tx    = 0;
-uint64_t rx    = 0;
-uint64_t last  = 0;
-char *prefix = NULL;
+#if ANDROID
+
+#include "ssrutils.h"
+static void dump_info_callback(int dump_level, const char* info, void* p) {
+    switch (dump_level) {
+    case 0:
+        LOGI("%s", info);
+        break;
+    case 1:
+        LOGW("%s", info);
+        break;
+    default:
+        LOGE("%s", info);
+        break;
+    }
+    (void)p;
+}
+
 #endif
 
 static void usage(void);
 
 struct ssr_client_state *g_state = NULL;
-void feedback_state(struct ssr_client_state *state, void *p);
-void state_set_force_quit(struct ssr_client_state *state, bool force_quit, int delay_ms);
+void feedback__state(struct ssr_client_state *state, void *p);
 void print_remote_info(const struct server_config *config);
 static bool verify_config(struct server_config *config);
 
@@ -65,16 +76,48 @@ void fn_onexit(void) {
     MEM_CHECK_DUMP_LEAKS();
 }
 
-struct cmd_line_info *cmds = NULL;
+volatile bool exit_dead_loop = true;
 
-int main(int argc, char **argv) {
+void dead_loop_impl(int argc, char * const argv[]) {
+#if defined(__WAIT_DEBUGGER_ATTACH__)
+    int index = 0;
+    for (index = 0; index < argc; ++index) {
+        if ( strcmp(argv[index], "--deadloop") == 0) {
+            exit_dead_loop = false;
+            break;
+        }
+    }
+    do {
+        // change the exit_dead_loop manually in debugger by you. (lldb) expr exit_dead_loop = 1
+        if (exit_dead_loop == false) {
+            sleep(1); // CPU yeild
+        }
+    } while (exit_dead_loop == false);
+    exit_dead_loop = true;
+#else
+    (void)argc; (void)argv;
+#endif
+}
+
+int main(int argc, char * const argv[]) {
+    struct cmd_line_info *cmds = NULL;
     struct server_config *config = NULL;
     int err = -1;
 
     #if (defined(__unix__) || defined(__linux__)) && !defined(__mips)
+    #if __ANDROID__
+    struct sigaction sa_pipe;
+    memset(&sa_pipe, 0, sizeof(sa_pipe));
+    sigemptyset(&sa_pipe.sa_mask);
+    sa_pipe.sa_handler = &sighandler;
+    sigaction(SIGPIPE, &sa_pipe, NULL);
+    #else
     struct sigaction sa = { {&sighandler}, {{0}}, 0, NULL };
     sigaction(SIGPIPE, &sa, NULL);
+    #endif
     #endif // defined(__unix__) || defined(__linux__)
+
+    dead_loop_impl(argc, argv);
 
     MEM_CHECK_BEGIN();
     MEM_CHECK_BREAK_ALLOC(63);
@@ -84,6 +127,10 @@ int main(int argc, char **argv) {
 
     do {
         set_app_name(argv[0]);
+
+#if ANDROID
+        set_dump_info_callback(dump_info_callback, NULL);
+#endif
 
         cmds = cmd_line_info_create(argc, argv);
 
@@ -128,16 +175,16 @@ int main(int argc, char **argv) {
             daemon_wrapper(argv[0], param);
         }
 
-#ifdef ANDROID
-        log_tx_rx  = cmds->log_tx_rx;
-        prefix = cmds->prefix;
+#if ANDROID
+        set_flag_of_log_tx_rx(cmds->log_tx_rx);
+        set_traffic_status_file_path(cmds->stat_path);
 #endif
 
         print_remote_info(config);
 
         // putenv("UV_THREADPOOL_SIZE=64"); // uv_os_setenv("UV_THREADPOOL_SIZE", "64"); // 
 
-        ssr_run_loop_begin(config, &feedback_state, NULL);
+        ssr_run_loop_begin(config, &feedback__state, cmds);
         g_state = NULL;
 
         err = 0;
@@ -203,10 +250,10 @@ void print_remote_info(const struct server_config *config) {
     pr_info("udp relay        %s\n", config->udp ? "yes" : "no");
 }
 
-void feedback_state(struct ssr_client_state *state, void *p) {
+void feedback__state(struct ssr_client_state *state, void *p) {
+    struct cmd_line_info *cmds = (struct cmd_line_info *)p;
     g_state = state;
-    (void)p;
-    state_set_force_quit(state, cmds->force_quit, 3000);
+    state_set_force_quit(state, cmds->force_quit, cmds->force_quit_delay_ms);
 }
 
 static bool verify_config(struct server_config *config) {

@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <assert.h>
 
 // for ntohs
 #if defined(WIN32) || defined(_WIN32)
@@ -39,7 +40,7 @@
 #include "ssrbuffer.h"
 #include "obfs.h"
 #include "crc32.h"
-#include "cstl_lib.h"
+#include <c_stl_lib.h>
 #include "strtrim.h"
 
 const char * ssr_strerror(enum ssr_error err) {
@@ -97,7 +98,7 @@ struct server_config * config_create(void) {
     return config;
 }
 
-struct server_config * config_clone(struct server_config* src) {
+struct server_config * config_clone(const struct server_config* src) {
     struct server_config *config = NULL;
     if (src == NULL) {
         return config;
@@ -136,7 +137,7 @@ void config_release(struct server_config *cf) {
         return;
     }
 
-    obj_map_destroy(cf->user_id_auth_key);
+    cstl_map_delete(cf->user_id_auth_key);
 
     object_safe_free((void **)&cf->listen_host);
     object_safe_free((void **)&cf->remote_host);
@@ -158,17 +159,80 @@ void config_release(struct server_config *cf) {
 // Since the obfuscation operation in SSRoT is redundant, we remove it.
 //
 void config_ssrot_revision(struct server_config* config) {
+    enum ss_cipher_type method;
     if (config == NULL) {
         return;
     }
+
+    method = ss_cipher_type_of_name(config->method);
+    assert(method != ss_cipher_max);
+
     if (config->over_tls_enable) {
+        // SSRoT don't support protocol and obfs features, downgrade to SS with TLS.
         string_safe_assign(&config->obfs, ssr_obfs_name_of_type(ssr_obfs_plain));
-        // don't support protocol recently.
         string_safe_assign(&config->protocol, ssr_protocol_name_of_type(ssr_protocol_origin));
     } else {
-        // support UDP in SSRoT only.
-        config->udp = false;
+        if (ss_cipher_aes_128_gcm <= method && method <= ss_cipher_xchacha20_ietf_poly1305 ) {
+            // AEAD and SSR are not compatible. So we downgraded it to SS
+            string_safe_assign(&config->obfs, ssr_obfs_name_of_type(ssr_obfs_plain));
+            string_safe_assign(&config->protocol, ssr_protocol_name_of_type(ssr_protocol_origin));
+        }
     }
+}
+
+bool config_is_overtls(const struct server_config* config) {
+    bool result = false;
+    struct server_config* cfg = config_clone(config);
+    config_ssrot_revision(cfg);
+
+    if (cfg->over_tls_enable) {
+        enum ssr_protocol proto = ssr_protocol_type_of_name(cfg->protocol);
+        enum ssr_obfs obfs = ssr_obfs_type_of_name(cfg->obfs);
+        enum ss_cipher_type method = ss_cipher_type_of_name(cfg->method);
+        // TODO: maybe the logic will change.
+        if (proto == ssr_protocol_origin && obfs == ssr_obfs_plain && method == ss_cipher_none) {
+            result = true;
+        }
+    }
+
+    config_release(cfg);
+    return result;
+}
+
+char* config_convert_to_overtls_json(const struct server_config* config, void* (*allocator)(size_t)) {
+    char* data = NULL;
+    const char* _template = "{          \r\n\
+        \"tunnel_path\": \"%s\",        \r\n\
+        \"method\" : \"%s\",            \r\n\
+        \"password\" : \"%s\",          \r\n\
+        \"client_settings\": {          \r\n\
+            \"server_host\": \"%s\",    \r\n\
+            \"server_port\" : %d,       \r\n\
+            \"server_domain\" : \"%s\", \r\n\
+            \"listen_host\" : \"%s\",   \r\n\
+            \"listen_port\" : %d        \r\n\
+        }                               \r\n\
+    }";
+    size_t len = strlen(_template) + 100 * 8;
+    if (config == NULL || config_is_overtls(config) == false || allocator == NULL) {
+        return NULL;
+    }
+    data = (char*)allocator(len);
+    if (data == NULL) {
+        return NULL;
+    }
+    memset(data, 0, len);
+    sprintf(data, _template,
+        config->over_tls_path,
+        config->method,
+        config->password,
+        config->remote_host,
+        config->remote_port,
+        config->over_tls_server_domain,
+        config->listen_host,
+        config->listen_port
+    );
+    return data;
 }
 
 static int uid_cmp(const void *left, const void *right) {
@@ -226,9 +290,9 @@ void config_add_user_id_with_auth_key(struct server_config *config, const char *
     char *a = strdup(auth_key);
 
     if (config->user_id_auth_key == NULL) {
-        config->user_id_auth_key = obj_map_create(uid_cmp, uid_destroy, uid_destroy);
+        config->user_id_auth_key = cstl_map_new(uid_cmp, uid_destroy, uid_destroy);
     }
-    obj_map_add(config->user_id_auth_key, &u, sizeof(void *), &a, sizeof(void *));
+    cstl_map_insert(config->user_id_auth_key, &u, sizeof(void *), &a, sizeof(void *));
 }
 
 bool config_is_user_exist(struct server_config *config, const char *user_id, const char **auth_key, bool *is_multi_user) {
@@ -241,9 +305,9 @@ bool config_is_user_exist(struct server_config *config, const char *user_id, con
     if (is_multi_user) {
         *is_multi_user = (config->user_id_auth_key != NULL);
     }
-    result = obj_map_exists(config->user_id_auth_key, &user_id);
+    result = (cstl_map_is_key_exists(config->user_id_auth_key, &user_id) != 0);
     if (result && auth_key) {
-        *auth_key = *((const char **)obj_map_find(config->user_id_auth_key, &user_id));
+        *auth_key = *((const char **)cstl_map_find(config->user_id_auth_key, &user_id));
     }
     return result;
 }
@@ -272,8 +336,8 @@ struct server_env_t * ssr_cipher_env_create(struct server_config *config, void *
     // init obfs
     init_obfs(env, config->protocol, config->obfs);
 
-    env->tunnel_set = cstl_set_container_create(tunnel_ctx_compare_for_c_set, NULL);
-    
+    env->tunnel_set = cstl_set_new(tunnel_ctx_compare_for_c_set, NULL);
+
     return env;
 }
 
@@ -285,120 +349,14 @@ void ssr_cipher_env_release(struct server_env_t *env) {
     object_safe_free(&env->obfs_global);
     cipher_env_release(env->cipher);
 
-    cstl_set_container_destroy(env->tunnel_set);
-    
+    cstl_set_delete(env->tunnel_set);
+
     object_safe_free((void **)&env);
 }
 
 bool is_completed_package(struct server_env_t *env, const uint8_t *data, size_t size) {
     (void)data;
     return size > (size_t)(enc_get_iv_len(env->cipher) + 1);
-}
-
-struct cstl_set * cstl_set_container_create(int(*compare_objs)(const void*,const void*), void(*destroy_obj)(void*)) {
-    return cstl_set_new(compare_objs, destroy_obj);
-}
-
-void cstl_set_container_destroy(struct cstl_set *set) {
-    cstl_set_delete(set);
-}
-
-void cstl_set_container_add(struct cstl_set *set, void *obj) {
-    ASSERT(set && obj);
-    cstl_set_insert(set, &obj, sizeof(void *));
-}
-
-void cstl_set_container_remove(struct cstl_set *set, void *obj) {
-    ASSERT(cstl_true == cstl_set_exists(set, &obj));
-    cstl_set_remove(set, &obj);
-}
-
-void cstl_set_container_traverse(struct cstl_set *set, void(*fn)(struct cstl_set *set, const void *obj, bool *stop, void *p), void *p) {
-    struct cstl_iterator *iterator;
-    const void *element;
-    bool stop = false;
-    if (set==NULL || fn==NULL) {
-        return;
-    }
-    iterator = cstl_set_new_iterator(set);
-    while( (element = iterator->next(iterator)) ) {
-        const void *obj = *((const void **) iterator->current_value(iterator));
-        fn(set, obj, &stop, p);
-        if (stop != false) { break; }
-    }
-    cstl_set_delete_iterator(iterator);
-}
-
-struct cstl_list * obj_list_create(int(*compare_objs)(const void*,const void*), void (*destroy_obj)(void*)) {
-    return cstl_list_new(destroy_obj, compare_objs);
-}
-
-void obj_list_destroy(struct cstl_list *list) {
-    cstl_list_destroy(list);
-}
-
-void obj_list_clear(struct cstl_list *list) {
-    cstl_list_clear(list);
-}
-
-void obj_list_insert(struct cstl_list* pList, size_t pos, void* elem, size_t elem_size) {
-    cstl_list_insert(pList, pos, elem, elem_size);
-}
-
-void obj_list_for_each(struct cstl_list* pSlist, void (*fn)(const void *elem, void *p), void *p) {
-    cstl_list_for_each (pSlist, fn, p);
-}
-
-const void * obj_list_element_at(struct cstl_list* pList, size_t pos) {
-    return cstl_list_element_at(pList, pos);
-}
-
-size_t obj_list_size(struct cstl_list* pSlist) {
-    return cstl_list_size(pSlist);
-}
-
-
-struct cstl_map * obj_map_create(int(*compare_key)(const void*,const void*), void (*destroy_key)(void*), void (*destroy_value)(void*)) {
-    return cstl_map_new(compare_key, destroy_key, destroy_value);
-}
-
-void obj_map_destroy(struct cstl_map *map) {
-    cstl_map_delete(map);
-}
-
-bool obj_map_add(struct cstl_map *map, void *key, size_t k_size, void *value, size_t v_size) {
-    return CSTL_ERROR_SUCCESS == cstl_map_insert(map, key, k_size, value, v_size);
-}
-
-bool obj_map_exists(struct cstl_map *map, const void *key) {
-    return cstl_map_exists(map, key) != cstl_false;
-}
-
-bool obj_map_replace(struct cstl_map *map, const void *key, const void *value, size_t v_size) {
-    return CSTL_ERROR_SUCCESS == cstl_map_replace(map, key, value, v_size);
-}
-
-void obj_map_remove(struct cstl_map *map, const void *key) {
-    cstl_map_remove(map, key);
-}
-
-const void * obj_map_find(struct cstl_map *map, const void *key) {
-    return cstl_map_find(map, key);
-}
-
-void obj_map_traverse(struct cstl_map *map, void(*fn)(const void *key, const void *value, void *p), void *p) {
-    struct cstl_iterator *iterator;
-    const void *element;
-    if (map==NULL || fn==NULL) {
-        return;
-    }
-    iterator = cstl_map_new_iterator(map);
-    while( (element = iterator->next(iterator)) ) {
-        const void *key = iterator->current_key(iterator);
-        const void *value = iterator->current_value(iterator);
-        fn(key, value, p);
-    }
-    cstl_map_delete_iterator(iterator);
 }
 
 void init_obfs(struct server_env_t *env, const char *protocol, const char *obfs) {
@@ -446,7 +404,7 @@ struct tunnel_cipher_ctx * tunnel_cipher_create(struct server_env_t *env, size_t
     server_info.buffer_size = SSR_BUFF_SIZE;
     server_info.cipher_env = env->cipher;
     {
-        server_info.param = config->obfs_param;
+        server_info.extra_param = config->obfs_param;
         server_info.g_data = env->obfs_global;
 
         tc->obfs = obfs_instance_create(config->obfs);
@@ -455,7 +413,7 @@ struct tunnel_cipher_ctx * tunnel_cipher_create(struct server_env_t *env, size_t
         }
     }
     {
-        server_info.param = config->protocol_param;
+        server_info.extra_param = config->protocol_param;
         server_info.g_data = env->protocol_global;
 
         tc->protocol = protocol_instance_create(config->protocol);
@@ -661,7 +619,7 @@ tunnel_cipher_server_decrypt(struct tunnel_cipher_ctx *tc,
                 *obfs_receipt = obfs->server_encode(obfs, empty);
                 buffer_release(empty);
             }
-            buffer_reset(ret);
+            buffer_reset(ret, true);
             return ret;
         }
     } else {
@@ -676,8 +634,9 @@ tunnel_cipher_server_decrypt(struct tunnel_cipher_ctx *tc,
         }
         */
         if (protocol && protocol->server_info.recv_iv[0] == 0) {
+            // This code block makes the compatibility of AEAD and SSR very difficult.
             size_t iv_len = protocol->server_info.iv_len;
-            memmove(protocol->server_info.recv_iv, buffer_get_data(ret, NULL), iv_len);
+            memmove(protocol->server_info.recv_iv, buffer_get_data(ret), iv_len);
             protocol->server_info.recv_iv_len = iv_len;
         }
 
@@ -707,8 +666,8 @@ bool pre_parse_header(struct buffer_t *data) {
     uint8_t tmp;
     size_t rand_data_size = 0;
     size_t hdr_len = 0;
-    size_t len = 0;
-    const uint8_t *buffer = buffer_get_data(data, &len);
+    size_t len = buffer_get_length(data);
+    const uint8_t *buffer = buffer_get_data(data);
 
     if (data==NULL || buffer==NULL || len==0) {
         return false;
@@ -727,12 +686,12 @@ bool pre_parse_header(struct buffer_t *data) {
             return false;
         }
 
-        buffer_shortened_to(data, hdr_len, len - hdr_len);
+        buffer_shortened_to(data, hdr_len, len - hdr_len, true);
         return true;
     }
     if (datatype == 0x81) {
         hdr_len = 1;
-        buffer_shortened_to(data, hdr_len, len - hdr_len);
+        buffer_shortened_to(data, hdr_len, len - hdr_len, true);
         return true;
     }
     if (datatype == 0x82) {
@@ -745,7 +704,7 @@ bool pre_parse_header(struct buffer_t *data) {
             // header too short, maybe wrong password or encryption method
             return false;
         }
-        buffer_shortened_to(data, hdr_len, len - hdr_len);
+        buffer_shortened_to(data, hdr_len, len - hdr_len, true);
         return true;
     }
     tmp = (~datatype);
@@ -765,12 +724,13 @@ bool pre_parse_header(struct buffer_t *data) {
         }
         start_pos = (size_t)(3 + (size_t)buffer[3]);
 
-        buffer_shortened_to(data, start_pos, data_size - (4 + start_pos));
+        buffer_shortened_to(data, start_pos, data_size - (4 + start_pos), true);
 
         if (data_size < origin_len) {
             size_t len2 = origin_len - data_size;
-            buffer = buffer_get_data(data, &len);
-            buffer_concatenate(data, buffer + data_size, len2);
+            buffer = buffer_get_data(data);
+            len = buffer_get_length(data);
+            buffer_concatenate_raw(data, buffer + data_size, len2);
         }
         return true;
     }

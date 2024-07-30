@@ -599,6 +599,11 @@ static void tunnel_socket_ctx_on_read_cb(struct socket_ctx* socket, int status, 
         }
         socket->buf = NULL;
 
+        if (tunnel->tunnel_is_terminated(tunnel)) {
+            tunnel_dump_error_info(tunnel, socket, "unexpect tunnel terminated.");
+            break;
+        }
+
         if (tunnel->tunnel_is_in_streaming(tunnel) && socket->check_timeout) {
             socket_ctx_timer_start(socket);
         }
@@ -672,6 +677,7 @@ void tunnel_dump_error_info(struct tunnel_ctx* tunnel, struct socket_ctx* socket
     int error = (int)socket->result;
     char* addr;
     const char* from = NULL;
+    char buff[256] = { 0 };
     if (socket == tunnel->outgoing) {
         addr = socks5_address_to_string(tunnel->desired_addr, &malloc, true);
         from = "_server_";
@@ -686,6 +692,6 @@ void tunnel_dump_error_info(struct tunnel_ctx* tunnel, struct socket_ctx* socket
         }
         from = "_client_";
     }
-    pr_err("%s about %s \"%s\": %s - %s", title, from, addr, uv_strerror(error), tunnel->extra_info);
+    pr_err("%s about %s \"%s\": %s - %s", title, from, addr, uv_strerror_r(error, buff, sizeof(buff)), tunnel->extra_info);
     free(addr);
 }

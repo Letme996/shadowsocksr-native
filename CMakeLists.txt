@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # ----------------------------------------------------------------------
 # Copyright © 2011-2015, RedJack, LLC.
 # All rights reserved.
@@ -29,10 +29,13 @@ include ( configure )
 configure_file ( ${CMAKE_CURRENT_SOURCE_DIR}/config.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config.h )
 ADD_DEFINITIONS(-DHAVE_CONFIG_H)
 
+add_subdirectory(depends/libbloom)
 add_subdirectory(depends/libsodium)
 add_subdirectory(depends/libuv)
 add_subdirectory(depends/json-c)
 add_subdirectory(depends/uv-mbed/win32)
+add_subdirectory(depends/uri-encode)
+add_subdirectory(depends/cstl)
 
 include_directories( ${CMAKE_CURRENT_BINARY_DIR} )
 

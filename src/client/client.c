@@ -1,6 +1,6 @@
 #include "base64.h"
 #include "common.h"
-#include "cstl_lib.h"
+#include <c_stl_lib.h>
 #include "defs.h"
 #include "dump_info.h"
 #include "encrypt.h"
@@ -63,7 +63,7 @@ struct udp_data_context {
     struct cstl_deque* recv_deque;
 
     struct client_ctx* owner; // __weak_ptr
-    struct udp_listener_ctx_t* udp_ctx; // __weak_ptr
+    struct client_ssrot_udp_listener_ctx* udp_ctx; // __weak_ptr
 };
 
 struct udp_data_context* udp_data_context_create(void);
@@ -73,8 +73,9 @@ struct client_ctx {
     struct tunnel_ctx* tunnel; // __weak_ptr
     struct server_env_t* env; // __weak_ptr
     struct tunnel_cipher_ctx* cipher;
-    struct buffer_t* init_pkg;
+    struct buffer_t* target_address_pkg;
     struct buffer_t* first_client_pkg;
+    bool round_trip_saving_shortcut;
     struct s5_ctx* parser; /* The SOCKS protocol parser. */
     enum tunnel_stage stage;
     void (*original_tunnel_shutdown)(struct tunnel_ctx* tunnel); /* ptr holder */
@@ -91,25 +92,13 @@ struct client_ctx {
     struct udp_data_context* udp_data_ctx;
 };
 
-#ifdef ANDROID
-static void stat_update_cb(void) {
-    if (log_tx_rx) {
-        uint64_t _now = uv_hrtime();
-        if (_now - last > 1000) {
-            send_traffic_stat(tx, rx);
-            last = _now;
-        }
-    }
-}
-#endif
-
 REF_COUNT_ADD_REF_DECL(client_ctx); // client_ctx_add_ref
 REF_COUNT_RELEASE_DECL(client_ctx); // client_ctx_release
 
-static struct buffer_t* initial_package_create(const struct s5_ctx* parser);
+static struct buffer_t* address_package_from_s5_parser(const struct s5_ctx* parser);
 static void tunnel_ssr_dispatcher(struct tunnel_ctx* tunnel, struct socket_ctx* socket);
 static void tunnel_tls_dispatcher(struct tunnel_ctx* tunnel, struct socket_ctx* socket);
-static void do_handshake(struct tunnel_ctx* tunnel);
+static void do_s5_handshake(struct tunnel_ctx* tunnel);
 static void do_wait_client_app_s5_request(struct tunnel_ctx* tunnel);
 static void do_parse_s5_request_from_client_app(struct tunnel_ctx* tunnel);
 static void do_common_connet_remote_server(struct tunnel_ctx* tunnel);
@@ -186,6 +175,7 @@ static bool init_done_cb(struct tunnel_ctx* tunnel, void* p) {
     ctx->parser = s5_ctx_create();
     ctx->cipher = NULL;
     ctx->stage = tunnel_stage_handshake;
+    ctx->target_address_pkg = buffer_create(SSR_BUFF_SIZE);
     ctx->first_client_pkg = buffer_create(SSR_BUFF_SIZE);
 
 #define SOCKET_DATA_BUFFER_SIZE 0x8000
@@ -205,7 +195,7 @@ struct tunnel_ctx* client_tunnel_initialize(uv_tcp_t* lx, unsigned int idle_time
 static void client_tunnel_connecting_print_info(struct tunnel_ctx* tunnel) {
     struct client_ctx* ctx = (struct client_ctx*)tunnel->data;
     char* tmp = socks5_address_to_string(tunnel->desired_addr, &malloc, true);
-    const char* udp = ctx->udp_data_ctx ? "[UDP]" : "";
+    const char* udp = ctx->udp_data_ctx ? "[udp]" : "";
 #if defined(__PRINT_INFO__)
     pr_info("++++ connecting %s \"%s\" ... ++++", udp, tmp);
 #endif
@@ -216,7 +206,7 @@ static void client_tunnel_connecting_print_info(struct tunnel_ctx* tunnel) {
 static void client_tunnel_shutdown_print_info(struct tunnel_ctx* tunnel, bool success) {
     struct client_ctx* ctx = (struct client_ctx*)tunnel->data;
     char* tmp = socks5_address_to_string(tunnel->desired_addr, &malloc, true);
-    const char* udp = (ctx->stage == tunnel_stage_s5_udp_accoc || ctx->udp_data_ctx) ? "[UDP]" : "";
+    const char* udp = (ctx->stage == tunnel_stage_s5_udp_accoc || ctx->udp_data_ctx) ? "[udp]" : "";
     if (!success) {
 #if defined(__PRINT_INFO__)
         pr_err("---- disconnected %s \"%s\" with failed. ---", udp, tmp);
@@ -275,7 +265,7 @@ static bool tunnel_is_terminated(struct tunnel_ctx* tunnel) {
     return (ctx->is_terminated != false);
 }
 
-static void _iterator_tunnel_shutdown(struct cstl_set* set, const void* obj, bool* stop, void* p) {
+static void _iterator_tunnel_shutdown(struct cstl_set* set, const void* obj, int* stop, void* p) {
     struct tunnel_ctx* tunnel = (struct tunnel_ctx*)obj;
     tunnel->tunnel_shutdown(tunnel);
     (void)set; (void)stop; (void)p;
@@ -285,7 +275,7 @@ void client_env_shutdown(struct server_env_t* env) {
     cstl_set_container_traverse(env->tunnel_set, &_iterator_tunnel_shutdown, NULL);
 }
 
-static struct buffer_t* initial_package_create(const struct s5_ctx* parser) {
+static struct buffer_t* address_package_from_s5_parser(const struct s5_ctx* parser) {
     size_t s = 0;
     uint8_t* b = s5_address_package_create(parser, &malloc, &s);
     struct buffer_t* buffer = buffer_create_from(b, s);
@@ -321,12 +311,16 @@ static void tunnel_ssr_dispatcher(struct tunnel_ctx* tunnel, struct socket_ctx* 
     case tunnel_stage_handshake:
         ASSERT(incoming->rdstate == socket_state_done);
         incoming->rdstate = socket_state_stop;
-        do_handshake(tunnel);
+        do_s5_handshake(tunnel);
         break;
     case tunnel_stage_handshake_replied:
         ASSERT(incoming->wrstate == socket_state_done);
         incoming->wrstate = socket_state_stop;
-        do_wait_client_app_s5_request(tunnel);
+        if (ctx->round_trip_saving_shortcut) {
+            do_socks5_reply_success(tunnel);
+        } else {
+            do_wait_client_app_s5_request(tunnel);
+        }
         break;
     case tunnel_stage_s5_request_from_client_app:
         ASSERT(incoming->rdstate == socket_state_done);
@@ -341,12 +335,23 @@ static void tunnel_ssr_dispatcher(struct tunnel_ctx* tunnel, struct socket_ctx* 
     case tunnel_stage_s5_response_done:
         ASSERT(incoming->wrstate == socket_state_done);
         incoming->wrstate = socket_state_stop;
-        socket_ctx_read(incoming, true);
-        ctx->stage = tunnel_stage_client_first_pkg;
+        if (buffer_get_length(ctx->first_client_pkg) > 0) {
+            do_common_connet_remote_server(tunnel);
+        } else {
+            socket_ctx_read(incoming, true);
+            ctx->stage = tunnel_stage_client_first_pkg;
+        }
         break;
     case tunnel_stage_client_first_pkg:
         ASSERT(incoming->rdstate == socket_state_done);
         incoming->rdstate = socket_state_stop;
+
+        {
+            uint8_t* data = (uint8_t*)incoming->buf->base;
+            size_t size = (size_t)incoming->result;
+            buffer_store(ctx->first_client_pkg, data, size);
+        }
+
         do_common_connet_remote_server(tunnel);
         break;
     case tunnel_stage_resolve_ssr_server_host_done:
@@ -412,12 +417,16 @@ static void tunnel_tls_dispatcher(struct tunnel_ctx* tunnel, struct socket_ctx* 
     case tunnel_stage_handshake:
         ASSERT(incoming->rdstate == socket_state_done);
         incoming->rdstate = socket_state_stop;
-        do_handshake(tunnel);
+        do_s5_handshake(tunnel);
         break;
     case tunnel_stage_handshake_replied:
         ASSERT(incoming->wrstate == socket_state_done);
         incoming->wrstate = socket_state_stop;
-        do_wait_client_app_s5_request(tunnel);
+        if (ctx->round_trip_saving_shortcut) {
+            do_socks5_reply_success(tunnel);
+        } else {
+            do_wait_client_app_s5_request(tunnel);
+        }
         break;
     case tunnel_stage_s5_request_from_client_app:
         ASSERT(incoming->rdstate == socket_state_done);
@@ -432,12 +441,23 @@ static void tunnel_tls_dispatcher(struct tunnel_ctx* tunnel, struct socket_ctx* 
     case tunnel_stage_s5_response_done:
         ASSERT(incoming->wrstate == socket_state_done);
         incoming->wrstate = socket_state_stop;
-        socket_ctx_read(incoming, true);
-        ctx->stage = tunnel_stage_client_first_pkg;
+        if (buffer_get_length(ctx->first_client_pkg) > 0) {
+            do_common_connet_remote_server(tunnel);
+        } else {
+            socket_ctx_read(incoming, true);
+            ctx->stage = tunnel_stage_client_first_pkg;
+        }
         break;
     case tunnel_stage_client_first_pkg:
         ASSERT(incoming->rdstate == socket_state_done);
         incoming->rdstate = socket_state_stop;
+
+        {
+            uint8_t* data = (uint8_t*)incoming->buf->base;
+            size_t size = (size_t)incoming->result;
+            buffer_store(ctx->first_client_pkg, data, size);
+        }
+
         do_common_connet_remote_server(tunnel);
         break;
     case tunnel_stage_auth_completion_done:
@@ -456,7 +476,7 @@ static void tunnel_tls_dispatcher(struct tunnel_ctx* tunnel, struct socket_ctx* 
     }
 }
 
-static void do_handshake(struct tunnel_ctx* tunnel) {
+static void do_s5_handshake(struct tunnel_ctx* tunnel) {
     enum s5_auth_method methods;
     struct socket_ctx* incoming = tunnel->incoming;
     struct client_ctx* ctx = (struct client_ctx*)tunnel->data;
@@ -469,7 +489,8 @@ static void do_handshake(struct tunnel_ctx* tunnel) {
     ASSERT(incoming->wrstate == socket_state_stop);
 
     if (incoming->result < 0) {
-        pr_err("read error: %s", uv_strerror((int)incoming->result));
+        char buff[256] = { 0 };
+        pr_err("read error: %s", uv_strerror_r((int)incoming->result, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -483,16 +504,6 @@ static void do_handshake(struct tunnel_ctx* tunnel) {
         return;
     }
 
-    if (size != 0) {
-        /* Could allow a round-trip saving shortcut here if the requested auth
-        * method is s5_auth_none (provided unauthenticated traffic is allowed.)
-        * Requires client support however.
-        */
-        pr_err("junk in handshake");
-        tunnel->tunnel_shutdown(tunnel);
-        return;
-    }
-
     if (result != s5_result_auth_select) {
         pr_err("handshake error: %s", str_s5_result(result));
         tunnel->tunnel_shutdown(tunnel);
@@ -502,6 +513,44 @@ static void do_handshake(struct tunnel_ctx* tunnel) {
     methods = s5_get_auth_methods(parser);
     if ((methods & s5_auth_none) && can_auth_none(tunnel)) {
         s5_select_auth(parser, s5_auth_none);
+
+        if (size > 0) {
+            /* A round-trip saving shortcut here if the requested auth method is s5_auth_none */
+
+            socks5_address_parse(data + 3, size - 3, tunnel->desired_addr, NULL);
+
+            result = s5_parse(parser, &data, &size);
+            if (result == s5_result_need_more) {
+                pr_err("%s", "junk in handshake");
+                tunnel->tunnel_shutdown(tunnel);
+                return;
+            }
+            if (result != s5_result_exec_cmd) {
+                pr_err("request error: %s", str_s5_result(result));
+                tunnel->tunnel_shutdown(tunnel);
+                return;
+            }
+
+            if (s5_get_cmd(parser) != s5_cmd_tcp_connect) {
+                pr_err("%s", "connect command only, not support bind / udp_assoc.");
+                tunnel->tunnel_shutdown(tunnel);
+                return;
+            }
+            if (tunnel->desired_addr->addr.ipv4.s_addr == 0 &&
+                tunnel->desired_addr->addr_type == SOCKS5_ADDRTYPE_IPV4) {
+                pr_err("%s", "zero target address, dropped.");
+                tunnel->tunnel_shutdown(tunnel);
+                return;
+            }
+            if (size > 0) {
+                buffer_store(ctx->first_client_pkg, data, size);
+            }
+            ctx->round_trip_saving_shortcut = true;
+            pr_info("%s", "socks5 handshake round-trip saving shortcut");
+        } else {
+            pr_info("%s", "socks5 handshake normal style called");
+        }
+
         tunnel_socket_ctx_write(tunnel, incoming, "\5\0", 2); /* No auth required. */
         ctx->stage = tunnel_stage_handshake_replied;
         return;
@@ -524,7 +573,8 @@ static void do_wait_client_app_s5_request(struct tunnel_ctx* tunnel) {
     ASSERT(incoming->wrstate == socket_state_stop);
 
     if (incoming->result < 0) {
-        pr_err("write error: %s", uv_strerror((int)incoming->result));
+        char buff[256] = { 0 };
+        pr_err("write error: %s", uv_strerror_r((int)incoming->result, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -550,7 +600,8 @@ static void do_parse_s5_request_from_client_app(struct tunnel_ctx* tunnel) {
     ASSERT(outgoing->wrstate == socket_state_stop);
 
     if (incoming->result < 0) {
-        pr_err("read error: %s", uv_strerror((int)incoming->result));
+        char buff[256] = { 0 };
+        pr_err("read error: %s", uv_strerror_r((int)incoming->result, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -558,7 +609,7 @@ static void do_parse_s5_request_from_client_app(struct tunnel_ctx* tunnel) {
     data = (uint8_t*)incoming->buf->base;
     size = (size_t)incoming->result;
 
-    socks5_address_parse(data + 3, size - 3, tunnel->desired_addr);
+    socks5_address_parse(data + 3, size - 3, tunnel->desired_addr, NULL);
 
     result = s5_parse(parser, &data, &size);
     if (result == s5_result_need_more) {
@@ -568,7 +619,11 @@ static void do_parse_s5_request_from_client_app(struct tunnel_ctx* tunnel) {
     }
 
     if (size != 0) {
-        pr_err("junk in request %u", (unsigned)size);
+        const char *info = "Not supported yet";
+        if (buffer_get_length(ctx->first_client_pkg)) {
+            info = "Weird incoming data";
+        }
+        pr_err("junk in request, size = %u, reason = \"%s\"", (unsigned)size, info);
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -621,9 +676,9 @@ static void do_parse_s5_request_from_client_app(struct tunnel_ctx* tunnel) {
 }
 
 static void _do_protect_socket(struct tunnel_ctx* tunnel, uv_os_sock_t fd) {
-#ifdef ANDROID
+#if ANDROID
     if (protect_socket(fd) == -1) {
-        LOGE("protect_socket");
+        pr_err("protect socket %d failed", fd);
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -631,7 +686,7 @@ static void _do_protect_socket(struct tunnel_ctx* tunnel, uv_os_sock_t fd) {
     (void)tunnel; (void)fd;
 }
 
-static void _tls_cli_tcp_conn_cb(struct tls_cli_ctx* cli, void* p) {
+static void _tls_cli_socket_created(struct tls_cli_ctx* cli, void* p) {
     struct client_ctx* ctx = (struct client_ctx*)p;
     struct tunnel_ctx* tunnel = ctx->tunnel;
     _do_protect_socket(tunnel, tls_client_get_tcp_fd(cli));
@@ -639,32 +694,38 @@ static void _tls_cli_tcp_conn_cb(struct tls_cli_ctx* cli, void* p) {
 
 static struct tls_cli_ctx* tls_client_creator(struct client_ctx* ctx, struct server_config* config) {
     struct tunnel_ctx* tunnel = ctx->tunnel;
-    struct tls_cli_ctx* tls_cli = tls_client_launch(tunnel->loop, config->over_tls_server_domain,
-        config->remote_host, config->remote_port, config->connect_timeout_ms);
-    tls_client_set_tcp_connect_callback(tls_cli, _tls_cli_tcp_conn_cb, ctx);
-    tls_cli_set_on_connection_established_callback(tls_cli, tls_cli_on_connection_established, ctx);
-    tls_cli_set_on_write_done_callback(tls_cli, tls_cli_on_write_done, ctx);
-    tls_cli_set_on_data_received_callback(tls_cli, tls_cli_on_data_received, ctx);
-
-    tunnel_ctx_add_ref(tunnel);
+    struct tls_cli_ctx* tls_cli;
+    int status;
+    tls_cli = tls_client_allocate(tunnel->loop, config->over_tls_server_domain);
+    ASSERT(tls_cli);
+    {
+        tls_cli_set_tcp_socket_created_callback(tls_cli, _tls_cli_socket_created, ctx);
+        tls_cli_set_on_connection_established_callback(tls_cli, tls_cli_on_connection_established, ctx);
+        tls_cli_set_on_write_done_callback(tls_cli, tls_cli_on_write_done, ctx);
+        tls_cli_set_on_data_received_callback(tls_cli, tls_cli_on_data_received, ctx);
+    }
+    status = tls_client_launch(tls_cli, config->remote_host, config->remote_port, config->connect_timeout_ms);
+    if (status < 0) {
+        tls_cli_ctx_release(tls_cli); // release the holder reference
+        tls_cli = NULL;
+    } else {
+        tunnel_ctx_add_ref(tunnel);
+    }
 
     return tls_cli;
 }
 
 static void do_common_connet_remote_server(struct tunnel_ctx* tunnel) {
-    struct socket_ctx* incoming = tunnel->incoming;
     struct socket_ctx* outgoing = tunnel->outgoing;
+    struct socket_ctx* incoming = tunnel->incoming;
     struct client_ctx* ctx = (struct client_ctx*)tunnel->data;
     struct s5_ctx* parser = ctx->parser;
     struct server_env_t* env = ctx->env;
     struct server_config* config = env->config;
-    uint8_t* data = (uint8_t*)incoming->buf->base;
-    size_t size = (size_t)incoming->result;
+    struct buffer_t* target_address = address_package_from_s5_parser(parser);
 
-    ctx->init_pkg = initial_package_create(parser);
+    buffer_replace(ctx->target_address_pkg, target_address);
     ctx->cipher = tunnel_cipher_create(ctx->env, 1452);
-
-    buffer_store(ctx->first_client_pkg, data, size);
 
     {
         struct obfs_t* protocol = ctx->cipher->protocol;
@@ -672,18 +733,26 @@ static void do_common_connet_remote_server(struct tunnel_ctx* tunnel) {
         struct server_info_t* info;
         info = protocol ? protocol->get_server_info(protocol) : (obfs ? obfs->get_server_info(obfs) : NULL);
         if (info) {
-            size_t s0 = 0;
-            const uint8_t* p0 = buffer_get_data(ctx->init_pkg, &s0);
+            size_t s0 = buffer_get_length(target_address);
+            const uint8_t* p0 = buffer_get_data(target_address);
             info->buffer_size = SSR_BUFF_SIZE;
             info->head_len = (int)get_s5_head_size(p0, s0, 30);
         }
     }
+
+    buffer_release(target_address);
 
     client_tunnel_connecting_print_info(tunnel);
 
     if (config->over_tls_enable) {
         ctx->stage = tunnel_stage_tls_connecting;
         ctx->tls_ctx = tls_client_creator(ctx, config);
+        if (ctx->tls_ctx == NULL) {
+            outgoing->result = UV_ENETUNREACH;
+            incoming->result = UV_ENETUNREACH;
+            tunnel_dump_error_info(tunnel, outgoing, "connect failed");
+            tunnel->tunnel_shutdown(tunnel);
+        }
         return;
     }
     else {
@@ -713,9 +782,10 @@ static void do_resolve_ssr_server_host_aftercare(struct tunnel_ctx* tunnel) {
     ASSERT(outgoing->wrstate == socket_state_stop);
 
     if (outgoing->result < 0) {
+        char buff[256] = { 0 };
         /* TODO Escape control characters in parser->daddr. */
         pr_err("lookup error for \"%s\": %s", config->remote_host,
-            uv_strerror((int)outgoing->result));
+            uv_strerror_r((int)outgoing->result, buff, sizeof(buff)));
         /* Send back a 'Host unreachable' reply. */
         tunnel_socket_ctx_write(tunnel, incoming, "\5\4\0\1\0\0\0\0\0\0", 10);
         ctx->stage = tunnel_stage_kill;
@@ -735,6 +805,11 @@ static void do_resolve_ssr_server_host_aftercare(struct tunnel_ctx* tunnel) {
     }
 
     do_connect_ssr_server(tunnel);
+}
+
+static void _android_protect_socket(uv_handle_t* handle, void *p) {
+    struct tunnel_ctx* tunnel = (struct tunnel_ctx*)p;
+    _do_protect_socket(tunnel, uv_stream_fd((uv_tcp_t*)handle));
 }
 
 /* Assumes that cx->outgoing.t.sa contains a valid AF_INET/AF_INET6 address. */
@@ -759,9 +834,12 @@ static void do_connect_ssr_server(struct tunnel_ctx* tunnel) {
         return;
     }
 
+    uv_set_socket_create_cb((uv_handle_t*)&outgoing->handle.tcp, &_android_protect_socket, tunnel);
+
     err = socket_ctx_connect(outgoing);
     if (err != 0) {
-        pr_err("connect error: %s", uv_strerror(err));
+        char buff[256] = { 0 };
+        pr_err("connect error: %s", uv_strerror_r(err, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -781,16 +859,15 @@ static void do_ssr_send_auth_package_to_server(struct tunnel_ctx* tunnel) {
 
     if (outgoing->result == 0) {
         const uint8_t* out_data = NULL; size_t out_data_len = 0;
-        struct buffer_t* tmp = buffer_create(SSR_BUFF_SIZE); buffer_replace(tmp, ctx->init_pkg);
+        struct buffer_t* tmp = buffer_clone(ctx->target_address_pkg);
         if (ssr_ok != tunnel_cipher_client_encrypt(ctx->cipher, tmp)) {
             buffer_release(tmp);
             tunnel->tunnel_shutdown(tunnel);
             return;
         }
 
-        _do_protect_socket(tunnel, uv_stream_fd(&outgoing->handle.tcp));
-
-        out_data = buffer_get_data(tmp, &out_data_len);
+        out_data = buffer_get_data(tmp);
+        out_data_len = buffer_get_length(tmp);
         tunnel_socket_ctx_write(tunnel, outgoing, out_data, out_data_len);
         buffer_release(tmp);
 
@@ -819,7 +896,8 @@ static void do_ssr_waiting_server_feedback(struct tunnel_ctx* tunnel) {
     ASSERT(outgoing->wrstate == socket_state_stop);
 
     if (outgoing->result < 0) {
-        pr_err("write error: %s", uv_strerror((int)outgoing->result));
+        char buff[256] = { 0 };
+        pr_err("write error: %s", uv_strerror_r((int)outgoing->result, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -848,7 +926,8 @@ static bool do_ssr_receipt_for_feedback(struct tunnel_ctx* tunnel) {
     ASSERT(outgoing->wrstate == socket_state_stop);
 
     if (outgoing->result < 0) {
-        pr_err("read error: %s", uv_strerror((int)outgoing->result));
+        char buff[256] = { 0 };
+        pr_err("read error: %s", uv_strerror_r((int)outgoing->result, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
         return done;
     }
@@ -859,7 +938,7 @@ static bool do_ssr_receipt_for_feedback(struct tunnel_ctx* tunnel) {
     ASSERT(buffer_get_length(buf) == 0);
 
     if (feedback) {
-        tunnel_socket_ctx_write(tunnel, outgoing, buffer_get_data(feedback, NULL), buffer_get_length(feedback));
+        tunnel_socket_ctx_write(tunnel, outgoing, buffer_get_data(feedback), buffer_get_length(feedback));
         ctx->stage = tunnel_stage_ssr_receipt_to_server_sent;
         buffer_release(feedback);
         done = true;
@@ -906,7 +985,8 @@ static void do_launch_streaming(struct tunnel_ctx* tunnel) {
     ASSERT(outgoing->wrstate == socket_state_stop);
 
     if (incoming->result < 0) {
-        pr_err("write error: %s", uv_strerror((int)incoming->result));
+        char buff[256] = { 0 };
+        pr_err("write error: %s", uv_strerror_r((int)incoming->result, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -914,17 +994,17 @@ static void do_launch_streaming(struct tunnel_ctx* tunnel) {
     {
         const uint8_t* out_data = NULL;
         size_t out_data_len = 0;
-        struct buffer_t* tmp = buffer_create(SSR_BUFF_SIZE);
-        buffer_replace(tmp, ctx->first_client_pkg);
+        struct buffer_t* tmp = buffer_clone(ctx->first_client_pkg);
+        buffer_reset(ctx->first_client_pkg, true);
         if (ssr_ok != tunnel_cipher_client_encrypt(ctx->cipher, tmp)) {
             buffer_release(tmp);
             tunnel->tunnel_shutdown(tunnel);
             return;
         }
-        out_data = buffer_get_data(tmp, &out_data_len);
+        out_data = buffer_get_data(tmp);
+        out_data_len = buffer_get_length(tmp);
         tunnel_socket_ctx_write(tunnel, outgoing, out_data, out_data_len);
         buffer_release(tmp);
-        buffer_reset(ctx->first_client_pkg);
     }
 
     socket_ctx_read(incoming, false);
@@ -956,14 +1036,11 @@ static void tunnel_ssr_client_streaming(struct tunnel_ctx* tunnel, struct socket
         buf = tunnel->tunnel_extract_data(tunnel, current_socket, &malloc, &len);
     }
 
-#ifdef ANDROID
-    if (log_tx_rx) {
-        if (current_socket == tunnel->incoming) {
-            tx += len;
-        } else {
-            rx += len;
-        }
-        stat_update_cb();
+#if ANDROID
+    if (current_socket == tunnel->incoming) {
+        traffic_status_update((uint64_t)len, 0);
+    } else {
+        traffic_status_update(0, (uint64_t)len);
     }
 #endif
 
@@ -1009,7 +1086,7 @@ static uint8_t* tunnel_extract_data(struct tunnel_ctx* tunnel, struct socket_ctx
         size_t len = buffer_get_length(buf);
         *size = len;
         result = (uint8_t*)allocator(len + 1);
-        memcpy(result, buffer_get_data(buf, NULL), len);
+        memcpy(result, buffer_get_data(buf), len);
         result[len] = 0;
     }
 
@@ -1027,7 +1104,7 @@ void client_ctx_destroy_internal(struct client_ctx* ctx) {
     if (ctx->cipher) {
         tunnel_cipher_release(ctx->cipher);
     }
-    buffer_release(ctx->init_pkg);
+    buffer_release(ctx->target_address_pkg);
     buffer_release(ctx->first_client_pkg);
     s5_ctx_release(ctx->parser);
     object_safe_free((void**)&ctx->sec_websocket_key);
@@ -1093,20 +1170,21 @@ static void tunnel_tls_do_launch_streaming(struct tunnel_ctx* tunnel) {
     ASSERT(incoming->wrstate == socket_state_stop);
 
     if (incoming->result < 0) {
-        PRINT_ERR("[TLS] write error: %s", uv_strerror((int)incoming->result));
+        char buff[256] = { 0 };
+        PRINT_ERR("[TLS] write error: %s", uv_strerror_r((int)incoming->result, buff, sizeof(buff)));
         tunnel->tunnel_shutdown(tunnel);
     } else {
         const uint8_t* out_data = NULL;
         size_t out_data_len = 0;
-        struct buffer_t* tmp = buffer_create(SSR_BUFF_SIZE);
-        buffer_replace(tmp, ctx->first_client_pkg);
-        buffer_reset(ctx->first_client_pkg);
+        struct buffer_t* tmp = buffer_clone(ctx->first_client_pkg);
+        buffer_reset(ctx->first_client_pkg, true);
         if (ssr_ok != tunnel_cipher_client_encrypt(ctx->cipher, tmp)) {
             buffer_release(tmp);
             tunnel->tunnel_shutdown(tunnel);
             return;
         }
-        out_data = buffer_get_data(tmp, &out_data_len);
+        out_data = buffer_get_data(tmp);
+        out_data_len = buffer_get_length(tmp);
         tls_cli_send_websocket_data(ctx, out_data, out_data_len);
         buffer_release(tmp);
 
@@ -1142,11 +1220,8 @@ void tunnel_tls_client_incoming_streaming(struct tunnel_ctx* tunnel, struct sock
             ASSERT(tunnel->tunnel_extract_data);
             buf = tunnel->tunnel_extract_data(tunnel, socket, &malloc, &len);
 
-#ifdef ANDROID
-            if (log_tx_rx) {
-                tx += len;
-            }
-            stat_update_cb();
+#if ANDROID
+            traffic_status_update((uint64_t)len, 0);
 #endif
 
             if (buf /* && size > 0 */) {
@@ -1170,18 +1245,19 @@ static void tls_cli_on_connection_established(struct tls_cli_ctx* tls_cli, int s
     struct socket_ctx* outgoing = tunnel->outgoing;
     struct server_config* config = ctx->env->config;
 
-    assert(ctx->tls_ctx == tls_cli);
-
     ctx->connection_status = status;
 
     if (status < 0) {
         char* tmp = socks5_address_to_string(tunnel->desired_addr, &malloc, true);
-        pr_err("[TLS] connecting \"%s\" failed: %d: %s", tmp, status, uv_strerror(status));
+        char buff[256] = { 0 };
+        pr_err("[TLS] connecting \"%s\" failed: %d: %s", tmp, status, uv_strerror_r(status, buff, sizeof(buff)));
         free(tmp);
 
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
+
+    assert(ctx->tls_ctx == tls_cli);
 
     if (tunnel->tunnel_is_terminated(tunnel)) {
         return;
@@ -1193,11 +1269,12 @@ static void tls_cli_on_connection_established(struct tls_cli_ctx* tls_cli, int s
     ASSERT(outgoing->wrstate == socket_state_stop);
 
     {
-        struct buffer_t* tmp = buffer_create(SSR_BUFF_SIZE); buffer_replace(tmp, ctx->init_pkg);
+        struct buffer_t* target_address = buffer_clone(ctx->target_address_pkg);
         if (ctx->udp_data_ctx) {
             const void* udp_pkg = cstl_deque_front(ctx->udp_data_ctx->send_deque);
             if (udp_pkg) {
-                buffer_replace(tmp, *((const struct buffer_t**)udp_pkg));
+                // target_address *NOT* contain address info, only UPD data instead.
+                buffer_replace(target_address, *((const struct buffer_t**)udp_pkg));
                 cstl_deque_pop_front(ctx->udp_data_ctx->send_deque);
             }
         }
@@ -1207,16 +1284,16 @@ static void tls_cli_on_connection_established(struct tls_cli_ctx* tls_cli, int s
             unsigned short domain_port = config->remote_port;
             uint8_t* buf = NULL;
             size_t len = 0;
-            size_t typ_len = 0;
-            const uint8_t* typ = buffer_get_data(tmp, &typ_len);
+            size_t data_len = buffer_get_length(target_address);
+            const uint8_t* data = buffer_get_data(target_address);
             char* key = websocket_generate_sec_websocket_key(&malloc);
             string_safe_assign(&ctx->sec_websocket_key, key);
             free(key);
 
             buf = websocket_connect_request(domain, domain_port, url_path, ctx->sec_websocket_key, &malloc, &len);
             {
-                char* b64addr = std_base64_encode_alloc(typ, (size_t)typ_len, &malloc);
-                static const char* addr_fmt = "Target-Address" ": %s\r\n";
+                char* b64addr = std_base64_encode_alloc(data, (size_t)data_len, &malloc);
+                static const char* addr_fmt = TARGET_ADDRESS_STR ": %s\r\n";
                 char* addr_field = (char*)calloc(strlen(addr_fmt) + strlen(b64addr) + 1, sizeof(*addr_field));
                 sprintf(addr_field, addr_fmt, b64addr);
                 buf = http_header_append_new_field(buf, &len, &realloc, addr_field);
@@ -1227,7 +1304,7 @@ static void tls_cli_on_connection_established(struct tls_cli_ctx* tls_cli, int s
                 size_t addr_len = 0;
                 uint8_t* addr_p = socks5_address_binary(&ctx->udp_data_ctx->target_addr, &malloc, &addr_len);
                 char* b64str = url_safe_base64_encode_alloc(addr_p, (size_t)addr_len, &malloc);
-                static const char* udp_fmt = "UDP" ": %s\r\n";
+                static const char* udp_fmt = UDP_TUNNEL ": %s\r\n";
                 char* udp_field = (char*)calloc(strlen(udp_fmt) + strlen(b64str) + 1, sizeof(*udp_field));
                 sprintf(udp_field, udp_fmt, b64str);
                 buf = http_header_append_new_field(buf, &len, &realloc, udp_field);
@@ -1240,7 +1317,7 @@ static void tls_cli_on_connection_established(struct tls_cli_ctx* tls_cli, int s
 
             free(buf);
         }
-        buffer_release(tmp);
+        buffer_release(target_address);
     }
 }
 
@@ -1250,7 +1327,8 @@ static void tls_cli_on_write_done(struct tls_cli_ctx* tls_cli, int status, void*
     assert(ctx->tls_ctx == tls_cli);
     if (status < 0) {
         char* tmp = socks5_address_to_string(tunnel->desired_addr, &malloc, true);
-        pr_err("[TLS] write \"%s\" failed: %d: %s", tmp, status, uv_strerror(status));
+        char buff[256] = { 0 };
+        pr_err("[TLS] write \"%s\" failed: %d: %s", tmp, status, uv_strerror_r(status, buff, sizeof(buff)));
         free(tmp);
 
         tunnel->tunnel_shutdown(tunnel);
@@ -1277,7 +1355,8 @@ static void tls_cli_on_data_received(struct tls_cli_ctx* tls_cli, int status, co
         if (status == UV_EOF) {
             (void)tmp; // pr_warn("connection with %s:%d closed abnormally.", tmp, port);
         } else {
-            pr_err("[TLS] read on %s error %ld: %s", tmp, (long)status, uv_strerror((int)status));
+            char buff[256] = { 0 };
+            pr_err("[TLS] read on %s error %ld: %s", tmp, (long)status, uv_strerror_r((int)status, buff, sizeof(buff)));
         }
         free(tmp);
 
@@ -1318,7 +1397,8 @@ static void tls_cli_on_data_received(struct tls_cli_ctx* tls_cli, int status, co
                     tmp = *((struct buffer_t**)udp_pkg);
 
                     tunnel_cipher_client_encrypt(ctx->cipher, tmp);
-                    p = buffer_get_data(tmp, &size);
+                    p = buffer_get_data(tmp);
+                    size = buffer_get_length(tmp);
                     tls_cli_send_websocket_data(ctx, p, size);
 
                     cstl_deque_pop_front(ctx->udp_data_ctx->send_deque);
@@ -1334,20 +1414,20 @@ static void tls_cli_on_data_received(struct tls_cli_ctx* tls_cli, int status, co
     }
     else if (ctx->stage == tunnel_stage_tls_streaming) {
 
-        buffer_concatenate(ctx->server_delivery_cache, data, size);
+        buffer_concatenate_raw(ctx->server_delivery_cache, data, size);
         do {
             ws_frame_info info = { WS_OPCODE_BINARY, 0, 0, 0, 0, 0 };
             struct buffer_t* tmp;
             enum ssr_error e;
             struct buffer_t* feedback = NULL;
-            size_t buf_len = 0;
-            const uint8_t* buf_data = buffer_get_data(ctx->server_delivery_cache, &buf_len);
+            size_t buf_len = buffer_get_length(ctx->server_delivery_cache);
+            const uint8_t* buf_data = buffer_get_data(ctx->server_delivery_cache);
             uint8_t* payload = websocket_retrieve_payload(buf_data, buf_len, &malloc, &info);
             (void)e;
             if (payload == NULL) {
                 break;
             }
-            buffer_shortened_to(ctx->server_delivery_cache, info.frame_size, buf_len - info.frame_size);
+            buffer_shortened_to(ctx->server_delivery_cache, info.frame_size, buf_len - info.frame_size, true);
 
             if (info.fin && info.masking == false && info.opcode == WS_OPCODE_CLOSE) {
                 ws_close_reason reason = WS_CLOSE_REASON_UNKNOWN;
@@ -1374,16 +1454,14 @@ static void tls_cli_on_data_received(struct tls_cli_ctx* tls_cli, int status, co
                 cstl_deque_push_back(ctx->udp_data_ctx->recv_deque, &t2, sizeof(struct buffer_t*));
             }
 
-            buffer_concatenate2(ctx->local_write_cache, tmp);
+            buffer_concatenate(ctx->local_write_cache, tmp);
 
             buffer_release(tmp);
             free(payload);
         } while (true);
 
-#ifdef ANDROID
-        if (log_tx_rx) {
-            rx += buffer_get_length(ctx->local_write_cache);
-        }
+#if ANDROID
+        traffic_status_update(0, (uint64_t)buffer_get_length(ctx->local_write_cache));
 #endif
 
         if ((buffer_get_length(ctx->local_write_cache) == 0) && ctx->tls_is_eof) {
@@ -1401,22 +1479,31 @@ static void tls_cli_on_data_received(struct tls_cli_ctx* tls_cli, int status, co
                 }
                 tmp = *((struct buffer_t**)udp_pkg);
 
-                p = buffer_get_data(tmp, &s);
+                p = buffer_get_data(tmp);
+                s = buffer_get_length(tmp);
                 udp_relay_send_data(ctx->udp_data_ctx->udp_ctx, &ctx->udp_data_ctx->src_addr, p, s);
+
+                {
+                    char* src = universal_address_to_string(&ctx->udp_data_ctx->src_addr, &malloc, true);
+                    char* tmp = socks5_address_to_string(&ctx->udp_data_ctx->target_addr, &malloc, true);
+                    pr_info("[udp] %s <== %s write back received data length = %ld", src, tmp, (long)s);
+                    free(tmp);
+                    free(src);
+                }
 
                 cstl_deque_pop_front(ctx->udp_data_ctx->recv_deque);
             } while (true);
 
-            buffer_reset(ctx->local_write_cache);
+            buffer_reset(ctx->local_write_cache, true);
             return;
         }
 
         {
-            size_t s = 0;
-            const uint8_t* p = buffer_get_data(ctx->local_write_cache, &s);
+            size_t s = buffer_get_length(ctx->local_write_cache);
+            const uint8_t* p = buffer_get_data(ctx->local_write_cache);
             if (p && s) {
                 tunnel_socket_ctx_write(tunnel, tunnel->incoming, p, s);
-                buffer_reset(ctx->local_write_cache);
+                buffer_reset(ctx->local_write_cache, true);
             }
         }
     }
@@ -1504,7 +1591,7 @@ void udp_data_context_destroy(struct udp_data_context* ptr) {
     }
 }
 
-static void _do_find_upd_tunnel(struct cstl_set* set, const void* obj, bool* stop, void* p) {
+static void _do_find_upd_tunnel(struct cstl_set* set, const void* obj, int* stop, void* p) {
     struct tunnel_ctx* tunnel = (struct tunnel_ctx*)obj;
     struct client_ctx* ctx = (struct client_ctx*)tunnel->data;
     struct udp_data_context* query_data = (struct udp_data_context*)p;
@@ -1514,20 +1601,20 @@ static void _do_find_upd_tunnel(struct cstl_set* set, const void* obj, bool* sto
             (memcmp(&iter->target_addr, &query_data->target_addr, sizeof(struct socks5_address)) == 0))
         {
             query_data->owner = ctx;
-            if (stop) { *stop = true; }
+            if (stop) { *stop = 1; }
         }
     }
     (void)set;
 }
 
-void udp_on_recv_data(struct udp_listener_ctx_t* udp_ctx, const union sockaddr_universal* src_addr, const struct buffer_t* data, void* p) {
+void udp_on_recv_data(struct client_ssrot_udp_listener_ctx* udp_ctx, const union sockaddr_universal* src_addr, const struct buffer_t* data, void* p) {
     uv_loop_t* loop = udp_relay_context_get_loop(udp_ctx);
     struct server_env_t* env = (struct server_env_t*)loop->data;
     struct server_config* config = env->config;
     struct tunnel_ctx* tunnel = NULL;
     struct client_ctx* ctx = NULL;
-    size_t data_len = 0, frag_number = 0;
-    const uint8_t* data_p = buffer_get_data(data, &data_len);
+    size_t data_len = buffer_get_length(data), frag_number = 0;
+    const uint8_t* data_p = buffer_get_data(data);
     struct udp_data_context* query_data;
     const uint8_t* raw_p = NULL; size_t raw_len = 0;
     struct buffer_t* out_ref;
@@ -1539,17 +1626,25 @@ void udp_on_recv_data(struct udp_listener_ctx_t* udp_ctx, const union sockaddr_u
 
     raw_p = s5_parse_upd_package(data_p, data_len, &query_data->target_addr, &frag_number, &raw_len);
     if (frag_number != 0) {
-        pr_err("%s", "[UDP] We don't process fragmented UDP packages and just drop them.");
+        pr_err("%s", "[udp] We don't process fragmented UDP packages and just drop them.");
         udp_data_context_destroy(query_data);
         return;
     }
     if (query_data->target_addr.addr_type == SOCKS5_ADDRTYPE_INVALID) {
-        pr_err("%s", "[UDP] target address invalid");
+        pr_err("%s", "[udp] target address invalid");
         udp_data_context_destroy(query_data);
         return;
     }
 
     out_ref = buffer_create_from(raw_p, raw_len);
+
+    {
+        char* src = universal_address_to_string(&query_data->src_addr, &malloc, true);
+        char* tmp = socks5_address_to_string(&query_data->target_addr, &malloc, true);
+        pr_info("[udp] %s ==> %s incoming data from lower-level app, length = %ld", src, tmp, (long)data_len);
+        free(tmp);
+        free(src);
+    }
 
     cstl_set_container_traverse(env->tunnel_set, &_do_find_upd_tunnel, query_data);
     if (query_data->owner) {
@@ -1561,7 +1656,7 @@ void udp_on_recv_data(struct udp_listener_ctx_t* udp_ctx, const union sockaddr_u
             if (ssr_ok != tunnel_cipher_client_encrypt(ctx->cipher, out_ref)) {
                 tunnel->tunnel_shutdown(tunnel);
             } else {
-                size_t len = 0; const uint8_t* p = buffer_get_data(out_ref, &len);
+                size_t len = buffer_get_length(out_ref); const uint8_t* p = buffer_get_data(out_ref);
                 tls_cli_send_websocket_data(ctx, p, len);
             }
             buffer_release(out_ref);
